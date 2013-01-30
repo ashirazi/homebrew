@@ -1,23 +1,25 @@
 require 'download_strategy'
-require 'dependencies'
+require 'dependency_collector'
 require 'formula_support'
 require 'hardware'
 require 'bottles'
 require 'patches'
 require 'compilers'
 require 'build_environment'
+require 'build_options'
 require 'extend/set'
 
 
 class Formula
   include FileUtils
+  extend BuildEnvironmentDSL
 
   attr_reader :name, :path, :homepage, :downloader
   attr_reader :stable, :bottle, :devel, :head, :active_spec
 
-  # The build folder, usually in /tmp.
-  # Will only be non-nil during the stage method.
-  attr_reader :buildpath
+  # The current working directory during builds and tests.
+  # Will only be non-nil inside #stage and #test.
+  attr_reader :buildpath, :testpath
 
   # Homebrew determines the name
   def initialize name='__UNKNOWN__', path=nil
@@ -38,6 +40,9 @@ class Formula
     # then a bottle is not available for the current platform.
     if @bottle and not (@bottle.checksum.nil? or @bottle.checksum.empty?)
       @bottle.url ||= bottle_base_url + bottle_filename(self)
+      if @bottle.cat_without_underscores
+        @bottle.url.gsub!(MacOS.cat.to_s, MacOS.cat_without_underscores.to_s)
+      end
     else
       @bottle = nil
     end
@@ -72,13 +77,7 @@ class Formula
 
   # if the dir is there, but it's empty we consider it not installed
   def installed?
-    return installed_prefix.children.length > 0
-  rescue
-    return false
-  end
-
-  def explicitly_requested?
-    ARGV.formulae.include?(self) rescue false
+    installed_prefix.children.length > 0 rescue false
   end
 
   def linked_keg
@@ -163,6 +162,13 @@ class Formula
     @downloader.cached_location
   end
 
+  # Can be overridden to selectively disable bottles from formulae.
+  # Defaults to true so overridden version does not have to check if bottles
+  # are supported.
+  def pour_bottle?
+    true
+  end
+
   # tell the user about any caveats regarding this package, return a string
   def caveats; nil end
 
@@ -220,7 +226,7 @@ class Formula
     stage do
       begin
         patch
-        # we allow formulas to do anything they want to the Ruby process
+        # we allow formulae to do anything they want to the Ruby process
         # so load any deps before this point! And exit asap afterwards
         yield self
       rescue RuntimeError, SystemCallError => e
@@ -229,6 +235,22 @@ class Formula
         end
         raise
       end
+    end
+  end
+
+  def lock
+    HOMEBREW_CACHE_FORMULA.mkpath
+    lockpath = HOMEBREW_CACHE_FORMULA/"#{@name}.brewing"
+    @lockfile = lockpath.open(File::RDWR | File::CREAT)
+    unless @lockfile.flock(File::LOCK_EX | File::LOCK_NB)
+      raise OperationInProgressError, @name
+    end
+  end
+
+  def unlock
+    unless @lockfile.nil?
+      @lockfile.flock(File::LOCK_UN)
+      @lockfile.close
     end
   end
 
@@ -357,7 +379,7 @@ class Formula
       install_type = :from_url
     elsif name.match bottle_regex
       bottle_filename = Pathname(name).realpath
-      name = name.split('-').first
+      name = bottle_filename.basename.to_s.rpartition('-').first
       path = Formula.path(name)
       install_type = :from_local_bottle
     else
@@ -437,29 +459,23 @@ class Formula
   def requirements; self.class.dependencies.requirements; end
 
   def env
-    @env ||= BuildEnvironment.new(self.class.environments)
+    @env ||= self.class.env
   end
 
   def conflicts
     requirements.select { |r| r.is_a? ConflictRequirement }
   end
 
-  # deps are in an installable order
-  # which means if a depends on b then b will be ordered before a in this list
-  def recursive_deps
-    Formula.expand_deps(self).flatten.uniq
+  # Returns a list of Dependency objects in an installable order, which
+  # means if a depends on b then b will be ordered before a in this list
+  def recursive_dependencies(&block)
+    Dependency.expand(self, &block)
   end
 
-  def self.expand_deps f
-    f.deps.map do |dep|
-      f_dep = Formula.factory dep.to_s
-      expand_deps(f_dep) << f_dep
-    end
-  end
-
+  # The full set of Requirements for this formula's dependency tree.
   def recursive_requirements
     reqs = ComparableSet.new
-    recursive_deps.each { |dep| reqs.merge dep.requirements }
+    recursive_dependencies.each { |d| reqs.merge d.to_formula.requirements }
     reqs.merge requirements
   end
 
@@ -554,7 +570,7 @@ protected
       unless $?.success?
         unless ARGV.verbose?
           f.flush
-          Kernel.system "/usr/bin/tail -n 5 #{logfn}"
+          Kernel.system "/usr/bin/tail", "-n", "5", logfn
         end
         f.puts
         require 'cmd/--config'
@@ -584,6 +600,20 @@ public
   # For FormulaInstaller.
   def verify_download_integrity fn
     @active_spec.verify_download_integrity(fn)
+  end
+
+  def test
+    ret = nil
+    mktemp do
+      @testpath = Pathname.pwd
+      ret = instance_eval(&self.class.test)
+      @testpath = nil
+    end
+    ret
+  end
+
+  def test_defined?
+    not self.class.instance_variable_get(:@test_defined).nil?
   end
 
 private
@@ -632,7 +662,12 @@ private
   end
 
   def self.method_added method
-    raise 'You cannot override Formula.brew' if method == :brew
+    case method
+    when :brew
+      raise "You cannot override Formula#brew"
+    when :test
+      @test_defined = true
+    end
   end
 
   class << self
@@ -664,7 +699,7 @@ private
     end
 
     def build
-      @build ||= BuildOptions.new(ARGV)
+      @build ||= BuildOptions.new(ARGV.options_only)
     end
 
     def url val=nil, specs=nil
@@ -710,20 +745,13 @@ private
       @stable.mirror(val)
     end
 
-    def environments
-      @environments ||= []
-    end
-
-    def env *settings
-      environments.concat [settings].flatten
-    end
-
     def dependencies
       @dependencies ||= DependencyCollector.new
     end
 
     def depends_on dep
-      dependencies.add(dep)
+      d = dependencies.add(dep)
+      post_depends_on(d) unless d.nil?
     end
 
     def option name, description=nil
@@ -777,6 +805,24 @@ private
         CompilerFailure.new(compiler, &block)
       else
         CompilerFailure.new(compiler)
+      end
+    end
+
+    def test &block
+      return @test unless block_given?
+      @test_defined = true
+      @test = block
+    end
+
+    private
+
+    def post_depends_on(dep)
+      # Generate with- or without- options for optional and recommended
+      # dependencies and requirements
+      if dep.optional? && !build.has_option?("with-#{dep.name}")
+        build.add("with-#{dep.name}", "Build with #{dep.name} support")
+      elsif dep.recommended? && !build.has_option?("without-#{dep.name}")
+        build.add("without-#{dep.name}", "Build without #{dep.name} support")
       end
     end
   end
